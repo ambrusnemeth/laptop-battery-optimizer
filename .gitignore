@@ -1,0 +1,18 @@
+# Environment variables
+.venv/
+env/
+venv/
+
+# Secrets
+.env
+
+# Dynamically generated data files
+archive/
+planner.log
+controller.log
+dashboard_data.json
+history.json
+
+# Python cache
+__pycache__/
+*.pyc
