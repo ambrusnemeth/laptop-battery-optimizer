@@ -114,7 +114,7 @@ def create_charging_plan():
     logging.info("Solving MILP Model...")
     solver = None
     try:
-        solver = pulp.HiGHS_CMD(msg=1, timeLimit=30)
+        solver = pulp.HiGHS(msg=1, timeLimit=30)
         prob.solve(solver)
     except Exception as e:
         logging.warning(f"HiGHS failed ({e}), falling back to CBC.")
