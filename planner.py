@@ -94,6 +94,8 @@ def create_charging_plan():
         val = entry.get('entryPerArea', {}).get('FI')
         if val is not None:
             prices.append(val)
+    SURCHARGE_EUR_PER_MWH = 4.9   # 0.49 c/kWh = 4.9 €/MWh
+    prices = [p + SURCHARGE_EUR_PER_MWH for p in prices]
     num_steps = len(prices)
     if num_steps == 0:
         logging.error("Extracted price list is empty.")
