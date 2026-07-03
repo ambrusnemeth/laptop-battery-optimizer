@@ -110,18 +110,11 @@ def create_charging_plan():
     CHARGE = 50.00 / intervals_per_hour
     prob += soc[0] == start_soc
     for t in range(num_steps):
-        prob += soc[t+1] <= soc[t] + x[t]*CHARGE - (1-x[t])*DISCHARGE
-        prob += soc[t+1] >= soc[t] - DISCHARGE
+        prob += soc[t+1] == soc[t] + x[t]*CHARGE - (1-x[t])*DISCHARGE
     prob += pulp.lpSum([x[t] * prices[t] for t in range(num_steps)])
     logging.info("Solving MILP Model...")
-    solver = None
-    try:
-        solver = pulp.HiGHS(msg=1, timeLimit=30)
-        prob.solve(solver)
-    except Exception as e:
-        logging.warning(f"HiGHS failed ({e}), falling back to CBC.")
-        solver = pulp.PULP_CBC_CMD(msg=1, timeLimit=30)
-        prob.solve(solver)
+    solver = pulp.HiGHS(msg=1, timeLimit=30)
+    prob.solve(solver)
     if pulp.LpStatus[prob.status] == 'Optimal':
         dashboard_data = {
             "prices": prices,
