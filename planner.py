@@ -19,16 +19,15 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 def atomic_write_json(filepath, obj):
-    """Write JSON atomically by using a temporary file and then renaming."""
     tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
     with open(tmp_path, 'w') as f:
         json.dump(obj, f, indent=4 if isinstance(obj, dict) else 2)
     os.replace(tmp_path, filepath)
 
 def fetch_nordpool_json(target_date):
-    """Fetches 96-interval price data from the modern Nord Pool API."""
+    """Fetches 96-interval price data for a single date."""
     date_str = target_date.strftime("%Y-%m-%d")
-    url = f"https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices"
+    url = "https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices"
     params = {
         "date": date_str,
         "market": "DayAhead",
@@ -43,35 +42,6 @@ def fetch_nordpool_json(target_date):
         logging.error(f"Network error fetching prices: {e}")
         return None
 
-def archive_day():
-    """Combines current data into a single file for the past day."""
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    hel_tz = ZoneInfo("Europe/Helsinki")
-    now_hel = datetime.datetime.now(hel_tz)
-    archive_date = (now_hel - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    archive_path = ARCHIVE_DIR / f"{archive_date}.json"
-    logging.info("--- Archive Check ---")
-    if not DATA_PATH.exists():
-        logging.warning(f"Archive Failed: {DATA_PATH} not found.")
-        return
-    if not HISTORY_PATH.exists():
-        logging.warning(f"Archive Failed: {HISTORY_PATH} not found.")
-        return
-    try:
-        with open(DATA_PATH, 'r') as f:
-            plan_data = json.load(f)
-        with open(HISTORY_PATH, 'r') as f:
-            soc_data = json.load(f)
-        archive_record = {
-            "prices": plan_data.get("prices"),
-            "plan": plan_data.get("plan"),
-            "actual_soc": soc_data
-        }
-        atomic_write_json(archive_path, archive_record)
-        logging.info(f"Successfully archived: {archive_path}")
-    except Exception as e:
-        logging.error(f"Archiving error: {e}")
-
 def get_current_soc():
     """Reads the actual physical battery level of the laptop."""
     try:
@@ -81,51 +51,107 @@ def get_current_soc():
         logging.warning(f"Could not read physical battery. Defaulting to 50. Error: {e}")
         return 50
 
-def create_charging_plan():
-    archive_day() 
-    target_date = datetime.date.today()+ datetime.timedelta(days=1)
-    logging.info(f"Targeting prices for: {target_date}")
-    raw_data = fetch_nordpool_json(target_date)
-    if not raw_data or 'multiAreaEntries' not in raw_data:
-        logging.warning("!!! Data not available yet.")
-        return
+def extract_prices(raw_data):
+    """Extracts price list from API response, adds surcharge."""
+    SURCHARGE_EUR_PER_MWH = 4.9   # 0.49 c/kWh = 4.9 €/MWh
     prices = []
     for entry in raw_data.get('multiAreaEntries', []):
         val = entry.get('entryPerArea', {}).get('FI')
         if val is not None:
-            prices.append(val)
-    SURCHARGE_EUR_PER_MWH = 4.9   # 0.49 c/kWh = 4.9 €/MWh
-    prices = [p + SURCHARGE_EUR_PER_MWH for p in prices]
-    num_steps = len(prices)
-    if num_steps == 0:
-        logging.error("Extracted price list is empty.")
+            prices.append(val + SURCHARGE_EUR_PER_MWH)
+    return prices
+
+# ... (all imports and functions above remain identical) ...
+
+def create_charging_plan():
+    hel_tz = ZoneInfo("Europe/Helsinki")
+    now_hel = datetime.datetime.now(hel_tz)
+
+    # 1. Determine the first 15-min interval that starts *after* now
+    minutes_since_midnight = now_hel.hour * 60 + now_hel.minute
+    next_block_index = (minutes_since_midnight // 15) + 1
+    next_block_minutes = next_block_index * 15
+    start_time = now_hel.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(minutes=next_block_minutes)
+    logging.info(f"Plan will start at {start_time.isoformat()}")
+
+    # 2. Fetch today's and tomorrow's prices
+    today_date = start_time.date()
+    tomorrow_date = today_date + datetime.timedelta(days=1)
+
+    raw_today = fetch_nordpool_json(today_date)
+    raw_tomorrow = fetch_nordpool_json(tomorrow_date)
+
+    if not raw_today or not raw_tomorrow:
+        logging.error("Failed to fetch required price data for both days.")
         return
-    logging.info(f"Successfully loaded {num_steps} intervals.")
+
+    prices_today = extract_prices(raw_today)
+    prices_tomorrow = extract_prices(raw_tomorrow)
+
+    if len(prices_today) != 96 or len(prices_tomorrow) != 96:
+        logging.error("Price lists do not have the expected 96 intervals.")
+        return
+
+    # 3. Build the price list for the horizon (start_time → end of tomorrow)
+    midnight_today = datetime.datetime.combine(today_date, datetime.time(0, 0), tzinfo=hel_tz)
+    today_intervals = []
+    for i, price in enumerate(prices_today):
+        interval_start = midnight_today + datetime.timedelta(minutes=i * 15)
+        if interval_start >= start_time:
+            today_intervals.append(price)
+
+    all_prices = today_intervals + prices_tomorrow
+    num_steps = len(all_prices)
+    logging.info(f"Planning horizon: {num_steps} intervals ({num_steps*15/60:.1f} hours)")
+
+    # 4. MILP setup (15-min intervals → 4 per hour)
+    INTERVALS_PER_HOUR = 4
+    DISCHARGE = 33.33 / INTERVALS_PER_HOUR   # % per 15 min
+    CHARGE = 50.00 / INTERVALS_PER_HOUR      # % per 15 min
+
     start_soc = get_current_soc()
     prob = pulp.LpProblem("Battery_Optimization", pulp.LpMinimize)
     x = pulp.LpVariable.dicts("charge", range(num_steps), cat='Binary')
     soc = pulp.LpVariable.dicts("soc", range(num_steps + 1), lowBound=20, upBound=100)
-    intervals_per_hour = num_steps / 24
-    DISCHARGE = 33.33 / intervals_per_hour
-    CHARGE = 50.00 / intervals_per_hour
+
     prob += soc[0] == start_soc
     for t in range(num_steps):
-        prob += soc[t+1] == soc[t] + x[t]*CHARGE - (1-x[t])*DISCHARGE
-    prob += pulp.lpSum([x[t] * prices[t] for t in range(num_steps)])
+        prob += soc[t+1] == soc[t] + x[t] * CHARGE - (1 - x[t]) * DISCHARGE
+
+    prob += pulp.lpSum([x[t] * all_prices[t] for t in range(num_steps)])
+
     logging.info("Solving MILP Model...")
     solver = pulp.HiGHS(msg=1, timeLimit=30)
     prob.solve(solver)
+
     if pulp.LpStatus[prob.status] == 'Optimal':
-        dashboard_data = {
-            "prices": prices,
+        new_plan = {
+            "prices": all_prices,
             "plan": [int(x[t].varValue) for t in range(num_steps)],
             "soc": [soc[t].varValue for t in range(num_steps)],
-            "timestamp": datetime.datetime.now().isoformat()
+            "start_time": start_time.isoformat(),
+            "timestamp": now_hel.isoformat()
         }
-        atomic_write_json(DATA_PATH, dashboard_data)
+
+        # Save a copy of the OLD plan before overwriting, if it exists
+        old_plan_path = DATA_PATH
+        if old_plan_path.exists():
+            plans_archive = BASE_DIR / "archive" / "plans"
+            plans_archive.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(old_plan_path, 'r') as f:
+                    old_data = json.load(f)
+                old_start = old_data.get("start_time", "unknown")
+                old_start_clean = old_start.replace(":", "").replace("+", "_")  # safe filename
+                backup_path = plans_archive / f"plan_{old_start_clean}.json"
+                shutil.copy2(old_plan_path, backup_path)
+                logging.info(f"Old plan saved to {backup_path}")
+            except Exception as e:
+                logging.warning(f"Could not backup old plan: {e}")
+
+        # Write the new plan
+        atomic_write_json(DATA_PATH, new_plan)
         logging.info("Success! Optimal plan saved to dashboard_data.json")
-        atomic_write_json(HISTORY_PATH, [])
-        logging.info("History reset for the new day.")
     else:
         logging.error(f"Solver failed. Status: {pulp.LpStatus[prob.status]}")
 

@@ -13,6 +13,8 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(page_title="Laptop Energy Optimizer", layout="wide")
 
+HEL_TZ = ZoneInfo("Europe/Helsinki")
+
 def get_real_battery():
     try:
         with open('/sys/class/power_supply/BAT0/capacity', 'r') as f:
@@ -29,6 +31,7 @@ st.sidebar.header("Navigation")
 selected_date = st.sidebar.date_input("Select Date", datetime.date.today())
 is_today = (selected_date == datetime.date.today())
 st.title(f"⚡ Energy Dashboard: {selected_date}")
+
 if is_today:
     col1, col2 = st.columns(2)
     with col1:
@@ -40,6 +43,8 @@ if is_today:
 plot_data = None
 hist_dt = []
 hist_soc = []
+plan_start = None
+
 if is_today:
     if DATA_PATH.exists():
         try:
@@ -48,8 +53,10 @@ if is_today:
             if HISTORY_PATH.exists():
                 with open(HISTORY_PATH, 'r') as f:
                     raw_hist = json.load(f)
-                    hist_dt = [datetime.datetime.fromisoformat(e['iso_time']) for e in raw_hist] # ISO strings -> python datetime
+                    hist_dt = [datetime.datetime.fromisoformat(e['iso_time']) for e in raw_hist]
                     hist_soc = [e['soc'] for e in raw_hist]
+            if plot_data and "start_time" in plot_data:
+                plan_start = datetime.datetime.fromisoformat(plot_data["start_time"])
         except Exception as e:
             st.error(f"Error reading live data: {e}")
 else:
@@ -61,25 +68,33 @@ else:
                 plot_data = {"prices": archived['prices'], "plan": archived['plan']}
                 hist_dt = [datetime.datetime.fromisoformat(e['iso_time']) for e in archived['actual_soc']]
                 hist_soc = [e['soc'] for e in archived['actual_soc']]
+                # For archived days, assume the plan covers the full day (midnight to midnight)
+                plan_start = datetime.datetime.combine(selected_date, datetime.time(0, 0), tzinfo=HEL_TZ)
         except Exception as e:
             st.error(f"Error reading archive: {e}")
     else:
         st.warning(f"No archive file found for {selected_date}")
 
-if plot_data:
-    start_time = datetime.datetime.combine(selected_date, datetime.time(1, 0))
-    end_time = start_time + datetime.timedelta(hours=24)
-    plot_times = [start_time + datetime.timedelta(minutes=i*15) for i in range(len(plot_data['prices']))]
+if plot_data and plan_start:
+    prices = plot_data['prices']
+    plan = plot_data['plan']
+    n = len(prices)
+    plot_times = [plan_start + datetime.timedelta(minutes=i * 15) for i in range(n)]
+
     fig = go.Figure()
+
+    # Price trace
     fig.add_trace(go.Scatter(
-        x=plot_times, 
-        y=plot_data['prices'],
+        x=plot_times,
+        y=prices,
         name="Price (EUR/MWh)",
         mode='lines',
         line=dict(color='#38BDF8', width=3, shape='hv'),
-        yaxis="y", 
+        yaxis="y",
         hovertemplate='%{x|%H:%M}: <b>%{y:.2f} EUR/MWh</b><extra></extra>'
     ))
+
+    # Actual SoC trace
     fig.add_trace(go.Scatter(
         x=hist_dt,
         y=hist_soc,
@@ -89,16 +104,18 @@ if plot_data:
         yaxis="y2",
         hovertemplate='SoC: <b>%{y:.1f}%</b><extra></extra>'
     ))
+
+    # Legend dummy for charging blocks
     fig.add_trace(go.Scatter(
-        x=[None],
-        y=[None],
+        x=[None], y=[None],
         mode='markers',
         marker=dict(size=10, color='rgba(16, 185, 129, 0.4)', symbol='square'),
         name="Planned Charging",
         showlegend=True
     ))
-    plan = plot_data['plan']
-    for i in range(len(plan)):
+
+    # Green vrects for planned charging intervals
+    for i in range(n):
         if plan[i] > 0:
             block_start = plot_times[i]
             block_end = block_start + datetime.timedelta(minutes=15)
@@ -109,6 +126,7 @@ if plot_data:
                 layer="below",
                 line_width=0
             )
+
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#0F172A",
@@ -118,19 +136,13 @@ if plot_data:
         legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
         hovermode="x unified",
         yaxis=dict(
-            title=dict(
-                text="Price (EUR/MWh)",
-                font=dict(color="#38BDF8")
-            ),
+            title=dict(text="Price (EUR/MWh)", font=dict(color="#38BDF8")),
             tickfont=dict(color="#38BDF8"),
             gridcolor="#1E293B",
             zeroline=False
         ),
         yaxis2=dict(
-            title=dict(
-                text="SoC %",
-                font=dict(color="#F59E0B")
-            ),
+            title=dict(text="SoC %", font=dict(color="#F59E0B")),
             tickfont=dict(color="#F59E0B"),
             overlaying="y",
             side="right",
@@ -139,10 +151,10 @@ if plot_data:
             zeroline=False
         ),
         xaxis=dict(
-            range=[start_time, end_time],
+            range=[plot_times[0], plot_times[-1] + datetime.timedelta(minutes=15)],
             showgrid=True,
             gridcolor="#1E293B",
-            tickformat="%H:%M",
+            tickformat="%H:%M\n%d %b",
             dtick=3600000 * 3
         )
     )

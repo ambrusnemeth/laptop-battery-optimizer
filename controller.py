@@ -20,7 +20,6 @@ HA_URL_OFF = f"{HA_BASE_URL}/api/services/switch/turn_off"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 def atomic_write_json(filepath, obj):
-    """Write JSON atomically by using a temporary file and then renaming."""
     tmp_path = filepath.with_suffix(filepath.suffix + ".tmp")
     with open(tmp_path, 'w') as f:
         json.dump(obj, f, indent=2)
@@ -33,7 +32,7 @@ def get_real_battery_percentage():
 def trigger_plug(turn_on):
     url = HA_URL_ON if turn_on else HA_URL_OFF
     headers = {
-        "Authorization": f"Bearer {HA_TOKEN}", 
+        "Authorization": f"Bearer {HA_TOKEN}",
         "Content-Type": "application/json"
     }
     requests.post(url, headers=headers, json={"entity_id": HA_ENTITY})
@@ -41,10 +40,11 @@ def trigger_plug(turn_on):
 def run_controller():
     helsinki_tz = ZoneInfo("Europe/Helsinki")
     now = datetime.datetime.now(helsinki_tz)
-    current_hour = str(now.hour)
     current_battery = get_real_battery_percentage()
     logging.info(str(now))
-    logging.info(str(current_battery))
+    logging.info(f"Battery: {current_battery}%")
+
+    # Log current SoC to history
     try:
         if HISTORY_PATH.exists():
             with open(HISTORY_PATH, 'r') as f:
@@ -58,25 +58,38 @@ def run_controller():
         atomic_write_json(HISTORY_PATH, history)
     except Exception as e:
         logging.error(f"Logging error: {e}")
+
+    # Load the plan and its start time
     try:
         with open(DATA_PATH, 'r') as f:
             data = json.load(f)
         plan_list = data["plan"]
-        schedule = {str(i): bool(v) for i, v in enumerate(plan_list)}
+        start_time_str = data["start_time"]
+        start_time = datetime.datetime.fromisoformat(start_time_str)
     except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
         logging.warning(f"Could not load plan: {e}. Defaulting to no charging.")
-        schedule = {}
-    
-    mins_since_midnight = (now.hour * 60) + now.minute
-    offset_minutes = (mins_since_midnight - 60) % 1440
-    current_index = str(offset_minutes // 15)
-    logging.info(f"Time: {now.strftime('%H:%M')}, Index: {current_index}")
-    plan_says_charge = schedule.get(current_index, False)
+        trigger_plug(turn_on=False)
+        return
+
+    # Compute the 15-min interval index from the plan start
+    seconds_elapsed = (now - start_time).total_seconds()
+    current_index = int(seconds_elapsed // 900)
+
+    # Determine charging decision
+    if current_index < 0 or current_index >= len(plan_list):
+        plan_says_charge = False
+        logging.info(f"Time is outside plan horizon (index {current_index}). Switching off.")
+    else:
+        plan_says_charge = bool(plan_list[current_index])
+        logging.info(f"Time: {now.strftime('%H:%M')}, Plan index: {current_index}, Charge: {plan_says_charge}")
+
+    # Emergency charge logic (unchanged)
     try:
         with open('/tmp/emergency_charge.flag', 'r') as f:
             emergency_mode = f.read().strip() == 'True'
     except FileNotFoundError:
         emergency_mode = False
+
     if current_battery <= 20:
         logging.info("Battery critical (<20%). Engaging emergency charge.")
         trigger_plug(turn_on=True)
@@ -92,7 +105,7 @@ def run_controller():
             logging.info("Emergency charging active, but plan is ON anyway. Staying ON.")
             trigger_plug(turn_on=True)
     else:
-        logging.info(f"Normal Operation. Plan for hour {current_hour}: {'ON' if plan_says_charge else 'OFF'}")
+        logging.info(f"Normal Operation. Plan says: {'ON' if plan_says_charge else 'OFF'}")
         trigger_plug(turn_on=plan_says_charge)
 
 if __name__ == "__main__":
