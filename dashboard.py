@@ -1,37 +1,42 @@
 import streamlit as st
-import json
+import sqlite3
 import datetime
 import plotly.graph_objects as go
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR / "dashboard_data.json"
-HISTORY_PATH = BASE_DIR / "history.json"
-ARCHIVE_DIR = BASE_DIR / "archive"
-ARCHIVE_DIR.mkdir(exist_ok=True)
-
-st.set_page_config(page_title="Laptop Energy Optimizer", layout="wide")
-
+DB_PATH = BASE_DIR / "battery.db"
 HEL_TZ = ZoneInfo("Europe/Helsinki")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 def get_real_battery():
     try:
         with open('/sys/class/power_supply/BAT0/capacity', 'r') as f:
             return int(f.read().strip())
-    except: return 0
+    except:
+        return 0
 
 def get_is_charging():
     try:
         with open('/sys/class/power_supply/BAT0/status', 'r') as f:
             return f.read().strip() == "Charging"
-    except: return False
+    except:
+        return False
 
+st.set_page_config(page_title="Laptop Energy Optimizer", layout="wide")
+
+# --- Sidebar & date selection ---
 st.sidebar.header("Navigation")
 selected_date = st.sidebar.date_input("Select Date", datetime.date.today())
 is_today = (selected_date == datetime.date.today())
 st.title(f"⚡ Energy Dashboard: {selected_date}")
 
+# --- Live metrics (today only) ---
 if is_today:
     col1, col2 = st.columns(2)
     with col1:
@@ -40,50 +45,70 @@ if is_today:
         st.metric("Plug Status", "CHARGING" if get_is_charging() else "DISCHARGING")
     st.divider()
 
-plot_data = None
-hist_dt = []
-hist_soc = []
-plan_start = None
+# --- Query database for the selected day ---
+conn = get_db()
+day_str = selected_date.isoformat()
 
+prices_rows = conn.execute(
+    "SELECT interval_start, price FROM prices WHERE date(interval_start) = ? ORDER BY interval_start",
+    (day_str,)
+).fetchall()
+
+schedule_rows = conn.execute(
+    "SELECT interval_start, decision, soc_forecast FROM schedule WHERE date(interval_start) = ? ORDER BY interval_start",
+    (day_str,)
+).fetchall()
+
+soc_rows = conn.execute(
+    "SELECT timestamp, soc FROM soc_log WHERE date(timestamp) = ? ORDER BY timestamp",
+    (day_str,)
+).fetchall()
+
+# Get plan creation (switch) time for today, if any
+switch_time = None
 if is_today:
-    if DATA_PATH.exists():
-        try:
-            with open(DATA_PATH, 'r') as f:
-                plot_data = json.load(f)
-            if HISTORY_PATH.exists():
-                with open(HISTORY_PATH, 'r') as f:
-                    raw_hist = json.load(f)
-                    hist_dt = [datetime.datetime.fromisoformat(e['iso_time']) for e in raw_hist]
-                    hist_soc = [e['soc'] for e in raw_hist]
-            if plot_data and "start_time" in plot_data:
-                plan_start = datetime.datetime.fromisoformat(plot_data["start_time"])
-        except Exception as e:
-            st.error(f"Error reading live data: {e}")
-else:
-    archive_file = ARCHIVE_DIR / f"{selected_date}.json"
-    if archive_file.exists():
-        try:
-            with open(archive_file, 'r') as f:
-                archived = json.load(f)
-                plot_data = {"prices": archived['prices'], "plan": archived['plan']}
-                hist_dt = [datetime.datetime.fromisoformat(e['iso_time']) for e in archived['actual_soc']]
-                hist_soc = [e['soc'] for e in archived['actual_soc']]
-                # For archived days, assume the plan covers the full day (midnight to midnight)
-                plan_start = datetime.datetime.combine(selected_date, datetime.time(0, 0), tzinfo=HEL_TZ)
-        except Exception as e:
-            st.error(f"Error reading archive: {e}")
-    else:
-        st.warning(f"No archive file found for {selected_date}")
+    row = conn.execute(
+        "SELECT start_time FROM plan_runs WHERE date(start_time) = ? ORDER BY start_time DESC LIMIT 1",
+        (day_str,)
+    ).fetchone()
+    if row:
+        # Attach Helsinki timezone
+        switch_time = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)
 
-if plot_data and plan_start:
-    prices = plot_data['prices']
-    plan = plot_data['plan']
-    n = len(prices)
-    plot_times = [plan_start + datetime.timedelta(minutes=i * 15) for i in range(n)]
+conn.close()
+
+# --- Build full‑day arrays (96 intervals) ---
+num_intervals = 96
+prices = [None] * num_intervals
+decisions = [0] * num_intervals
+forecast_soc = [None] * num_intervals
+
+day_start = datetime.datetime.combine(selected_date, datetime.time(0, 0), tzinfo=HEL_TZ)
+
+for row in schedule_rows:
+    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)   # ← make aware!
+    i = int((ts - day_start).total_seconds() // 900)
+    if 0 <= i < num_intervals:
+        decisions[i] = row[1]
+        forecast_soc[i] = row[2] if row[2] is not None else None
+
+for row in prices_rows:
+    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)   # ← make aware!
+    i = int((ts - day_start).total_seconds() // 900)
+    if 0 <= i < num_intervals:
+        prices[i] = row[1]
+
+# SoC history – also aware
+hist_dt = [datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ) for row in soc_rows]
+hist_soc = [row[1] for row in soc_rows]
+
+# --- Plotting ---
+if any(p is not None for p in prices) or any(d for d in decisions):
+    plot_times = [day_start + datetime.timedelta(minutes=i * 15) for i in range(num_intervals)]
 
     fig = go.Figure()
 
-    # Price trace
+    # Price line
     fig.add_trace(go.Scatter(
         x=plot_times,
         y=prices,
@@ -94,7 +119,7 @@ if plot_data and plan_start:
         hovertemplate='%{x|%H:%M}: <b>%{y:.2f} EUR/MWh</b><extra></extra>'
     ))
 
-    # Actual SoC trace
+    # Actual SoC line
     fig.add_trace(go.Scatter(
         x=hist_dt,
         y=hist_soc,
@@ -105,7 +130,7 @@ if plot_data and plan_start:
         hovertemplate='SoC: <b>%{y:.1f}%</b><extra></extra>'
     ))
 
-    # Legend dummy for charging blocks
+    # Dummy legend entry for charging blocks
     fig.add_trace(go.Scatter(
         x=[None], y=[None],
         mode='markers',
@@ -114,9 +139,9 @@ if plot_data and plan_start:
         showlegend=True
     ))
 
-    # Green vrects for planned charging intervals
-    for i in range(n):
-        if plan[i] > 0:
+    # Green rectangles where charging is planned
+    for i in range(num_intervals):
+        if decisions[i] > 0:
             block_start = plot_times[i]
             block_end = block_start + datetime.timedelta(minutes=15)
             fig.add_vrect(
@@ -127,6 +152,27 @@ if plot_data and plan_start:
                 line_width=0
             )
 
+    # Dashed vertical line when the plan was created (today only)
+    if is_today and switch_time:
+        fig.add_vline(
+            x=switch_time,
+            line_dash="dash",
+            line_color="#10B981",
+            line_width=2,
+            opacity=1.0
+            # NO annotation_text here – we'll add it manually
+        )
+        fig.add_annotation(
+            x=switch_time,
+            y=1,                    # top of the plot (paper coordinates)
+            yref="paper",
+            text="New plan",
+            showarrow=False,
+            xanchor="left",
+            font=dict(color="#10B981", size=12)
+        )
+
+    # Layout
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#0F172A",
@@ -151,13 +197,14 @@ if plot_data and plan_start:
             zeroline=False
         ),
         xaxis=dict(
-            range=[plot_times[0], plot_times[-1] + datetime.timedelta(minutes=15)],
+            range=[day_start, day_start + datetime.timedelta(days=1)],
             showgrid=True,
             gridcolor="#1E293B",
-            tickformat="%H:%M\n%d %b",
+            tickformat="%H:%M",
             dtick=3600000 * 3
         )
     )
+
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("Select a date in the sidebar to view data.")
+    st.info("No data available for this date.")

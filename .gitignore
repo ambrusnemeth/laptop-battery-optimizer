@@ -12,6 +12,7 @@ planner.log
 controller.log
 dashboard_data.json
 history.json
+battery.db
 
 # Python cache
 __pycache__/

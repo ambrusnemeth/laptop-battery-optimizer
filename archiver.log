@@ -61,3 +61,6 @@
 2026-07-05 00:01:01 WARNING: No plan found for 2026-07-04 14:45:00+03:00. Filling with 0 and NaN price.
 2026-07-05 00:01:01 INFO: Archived 2026-07-04 to /home/admin-ambrus/laptop-battery-optimizer/archive/2026-07-04.json (276 SoC points)
 2026-07-05 00:01:01 INFO: Trimmed history.json, kept 37 entries for today.
+2026-07-05 21:01:01 INFO: Archiving 2026-07-05
+2026-07-05 21:01:01 INFO: Archived 2026-07-05 to /home/admin-ambrus/laptop-battery-optimizer/archive/2026-07-05.json (261 SoC points)
+2026-07-05 21:01:01 INFO: Trimmed history.json, kept 0 entries for today.
