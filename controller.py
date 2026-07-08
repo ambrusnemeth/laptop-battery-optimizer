@@ -49,12 +49,10 @@ def trigger_plug(turn_on):
     }
     requests.post(url, headers=headers, json={"entity_id": HA_ENTITY})
 
-
 def get_current_interval(now_hel):
-    """Return the start of the 15-min block containing now_hel."""
-    minute_block = (now_hel.hour * 60 + now_hel.minute) // 15
-    return now_hel.replace(hour=0, minute=0, second=0, microsecond=0) \
-           + datetime.timedelta(minutes=minute_block * 15)
+    """Return the start of the 5‑min block containing now_hel."""
+    minute_block = (now_hel.hour * 60 + now_hel.minute) // 5
+    return now_hel.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(minutes=minute_block * 5)
 
 
 def run_controller():

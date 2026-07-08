@@ -9,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "battery.db"
 HEL_TZ = ZoneInfo("Europe/Helsinki")
 
+# ── helpers ──────────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -28,15 +29,16 @@ def get_is_charging():
     except:
         return False
 
+# ── page config ──────────────────────────────────────────
 st.set_page_config(page_title="Laptop Energy Optimizer", layout="wide")
 
-# --- Sidebar & date selection ---
+# ── sidebar & date selection ─────────────────────────────
 st.sidebar.header("Navigation")
 selected_date = st.sidebar.date_input("Select Date", datetime.date.today())
 is_today = (selected_date == datetime.date.today())
 st.title(f"⚡ Energy Dashboard: {selected_date}")
 
-# --- Live metrics (today only) ---
+# ── live metrics (today only) ────────────────────────────
 if is_today:
     col1, col2 = st.columns(2)
     with col1:
@@ -45,7 +47,7 @@ if is_today:
         st.metric("Plug Status", "CHARGING" if get_is_charging() else "DISCHARGING")
     st.divider()
 
-# --- Query database for the selected day ---
+# ── query database for the selected day ──────────────────
 conn = get_db()
 day_str = selected_date.isoformat()
 
@@ -64,7 +66,7 @@ soc_rows = conn.execute(
     (day_str,)
 ).fetchall()
 
-# Get plan creation (switch) time for today, if any
+# plan creation time (switch_time) for today
 switch_time = None
 if is_today:
     row = conn.execute(
@@ -72,43 +74,40 @@ if is_today:
         (day_str,)
     ).fetchone()
     if row:
-        # Attach Helsinki timezone
         switch_time = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)
 
 conn.close()
 
-# --- Build full‑day arrays (96 intervals) ---
-num_intervals = 96
+# ── build full‑day arrays (288 intervals of 5 minutes) ──
+num_intervals = 288
 prices = [None] * num_intervals
 decisions = [0] * num_intervals
-forecast_soc = [None] * num_intervals
 
 day_start = datetime.datetime.combine(selected_date, datetime.time(0, 0), tzinfo=HEL_TZ)
 
 for row in schedule_rows:
-    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)   # ← make aware!
-    i = int((ts - day_start).total_seconds() // 900)
+    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)
+    i = int((ts - day_start).total_seconds() // 300)   # 300 seconds = 5 min
     if 0 <= i < num_intervals:
         decisions[i] = row[1]
-        forecast_soc[i] = row[2] if row[2] is not None else None
 
 for row in prices_rows:
-    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)   # ← make aware!
-    i = int((ts - day_start).total_seconds() // 900)
+    ts = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)
+    i = int((ts - day_start).total_seconds() // 300)
     if 0 <= i < num_intervals:
         prices[i] = row[1]
 
-# SoC history – also aware
+# actual SoC history
 hist_dt = [datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ) for row in soc_rows]
 hist_soc = [row[1] for row in soc_rows]
 
-# --- Plotting ---
+# ── plot ─────────────────────────────────────────────────
 if any(p is not None for p in prices) or any(d for d in decisions):
-    plot_times = [day_start + datetime.timedelta(minutes=i * 15) for i in range(num_intervals)]
+    plot_times = [day_start + datetime.timedelta(minutes=i * 5) for i in range(num_intervals)]
 
     fig = go.Figure()
 
-    # Price line
+    # 1) Price line
     fig.add_trace(go.Scatter(
         x=plot_times,
         y=prices,
@@ -119,7 +118,7 @@ if any(p is not None for p in prices) or any(d for d in decisions):
         hovertemplate='%{x|%H:%M}: <b>%{y:.2f} EUR/MWh</b><extra></extra>'
     ))
 
-    # Actual SoC line
+    # 2) Actual SoC line
     fig.add_trace(go.Scatter(
         x=hist_dt,
         y=hist_soc,
@@ -130,7 +129,7 @@ if any(p is not None for p in prices) or any(d for d in decisions):
         hovertemplate='SoC: <b>%{y:.1f}%</b><extra></extra>'
     ))
 
-    # Dummy legend entry for charging blocks
+    # 3) Dummy legend entry for planned charging
     fig.add_trace(go.Scatter(
         x=[None], y=[None],
         mode='markers',
@@ -139,11 +138,11 @@ if any(p is not None for p in prices) or any(d for d in decisions):
         showlegend=True
     ))
 
-    # Green rectangles where charging is planned
+    # 4) Green rectangles where charging is planned (5‑min width)
     for i in range(num_intervals):
         if decisions[i] > 0:
             block_start = plot_times[i]
-            block_end = block_start + datetime.timedelta(minutes=15)
+            block_end = block_start + datetime.timedelta(minutes=5)
             fig.add_vrect(
                 x0=block_start, x1=block_end,
                 fillcolor="#10B981",
@@ -152,7 +151,7 @@ if any(p is not None for p in prices) or any(d for d in decisions):
                 line_width=0
             )
 
-    # Dashed vertical line when the plan was created (today only)
+    # 5) Dashed vertical line for plan creation (today only)
     if is_today and switch_time:
         fig.add_vline(
             x=switch_time,
@@ -160,11 +159,10 @@ if any(p is not None for p in prices) or any(d for d in decisions):
             line_color="#10B981",
             line_width=2,
             opacity=1.0
-            # NO annotation_text here – we'll add it manually
         )
         fig.add_annotation(
             x=switch_time,
-            y=1,                    # top of the plot (paper coordinates)
+            y=1,
             yref="paper",
             text="New plan",
             showarrow=False,
@@ -201,7 +199,7 @@ if any(p is not None for p in prices) or any(d for d in decisions):
             showgrid=True,
             gridcolor="#1E293B",
             tickformat="%H:%M",
-            dtick=3600000 * 3
+            dtick=3600000 * 2   # tick every 2 hours (keeps it readable with 5‑min grid)
         )
     )
 

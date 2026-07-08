@@ -13,6 +13,7 @@ controller.log
 dashboard_data.json
 history.json
 battery.db
+battery_backup.db
 
 # Python cache
 __pycache__/
