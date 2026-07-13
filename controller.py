@@ -61,7 +61,6 @@ def run_controller():
 
     logging.info(f"Time: {now_hel.isoformat()}, Battery: {current_battery}%")
 
-    # Log SoC to database (naive Helsinki)
     conn = get_db()
     conn.execute(
         "INSERT OR REPLACE INTO soc_log(timestamp, soc) VALUES (?, ?)",
@@ -69,7 +68,6 @@ def run_controller():
     )
     conn.commit()
 
-    # Get plan decision for current interval
     interval = get_current_interval(now_hel)
     naive_interval = interval.replace(tzinfo=None).isoformat()
 
@@ -83,7 +81,6 @@ def run_controller():
 
     logging.info(f"Interval: {naive_interval}, Plan says: {'ON' if plan_says_charge else 'OFF'}")
 
-    # Emergency logic
     try:
         with open('/tmp/emergency_charge.flag', 'r') as f:
             emergency_mode = f.read().strip() == 'True'

@@ -47,10 +47,11 @@ if is_today:
         st.metric("Plug Status", "CHARGING" if get_is_charging() else "DISCHARGING")
     st.divider()
 
-# ── query database for the selected day ──────────────────
+# ── query database ───────────────────────────────────────
 conn = get_db()
 day_str = selected_date.isoformat()
 
+# Main plot data
 prices_rows = conn.execute(
     "SELECT interval_start, price FROM prices WHERE date(interval_start) = ? ORDER BY interval_start",
     (day_str,)
@@ -66,7 +67,7 @@ soc_rows = conn.execute(
     (day_str,)
 ).fetchall()
 
-# plan creation time (switch_time) for today
+# Plan creation time
 switch_time = None
 if is_today:
     row = conn.execute(
@@ -75,6 +76,16 @@ if is_today:
     ).fetchone()
     if row:
         switch_time = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ)
+
+# Dynamic rates history (all time)
+rate_rows = conn.execute(
+    "SELECT timestamp, charge_rate, discharge_rate FROM rate_log ORDER BY timestamp"
+).fetchall()
+
+# Battery capacity history (all time)
+cap_rows = conn.execute(
+    "SELECT timestamp, capacity FROM capacity_log ORDER BY timestamp"
+).fetchall()
 
 conn.close()
 
@@ -101,7 +112,7 @@ for row in prices_rows:
 hist_dt = [datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ) for row in soc_rows]
 hist_soc = [row[1] for row in soc_rows]
 
-# ── plot ─────────────────────────────────────────────────
+# ── main plot ────────────────────────────────────────────
 if any(p is not None for p in prices) or any(d for d in decisions):
     plot_times = [day_start + datetime.timedelta(minutes=i * 5) for i in range(num_intervals)]
 
@@ -199,10 +210,86 @@ if any(p is not None for p in prices) or any(d for d in decisions):
             showgrid=True,
             gridcolor="#1E293B",
             tickformat="%H:%M",
-            dtick=3600000 * 2   # tick every 2 hours (keeps it readable with 5‑min grid)
+            dtick=3600000 * 2   # tick every 2 hours
         )
     )
 
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("No data available for this date.")
+
+# ── Dynamic rates & capacity charts (log time) ───────────
+st.divider()
+now_for_log = datetime.datetime.now(HEL_TZ)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Charge / Discharge Rate")
+    if rate_rows:
+        # Convert to datetime and days ago
+        dates_aware = [datetime.datetime.fromisoformat(r[0]).replace(tzinfo=HEL_TZ) for r in rate_rows]
+        days_ago = [(now_for_log - d).total_seconds() / 86400 + 0.001 for d in dates_aware]
+        charge_vals = [r[1] for r in rate_rows]
+        discharge_vals = [r[2] for r in rate_rows]
+
+        fig_rates = go.Figure()
+        fig_rates.add_trace(go.Scatter(
+            x=days_ago, y=charge_vals,
+            mode='lines+markers',
+            line=dict(color='#10B981', width=2),
+            marker=dict(size=4),
+            name="Charge Rate"
+        ))
+        fig_rates.add_trace(go.Scatter(
+            x=days_ago, y=discharge_vals,
+            mode='lines+markers',
+            line=dict(color='#F59E0B', width=2),
+            marker=dict(size=4),
+            name="Discharge Rate"
+        ))
+        fig_rates.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0F172A",
+            plot_bgcolor="#0F172A",
+            height=350,
+            margin=dict(l=50, r=30, t=50, b=50),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            xaxis=dict(title="Days ago", type="log", tickformat=".1f", gridcolor="#1E293B"),
+            yaxis=dict(title="% per 5 min", gridcolor="#1E293B"),
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_rates, use_container_width=True)
+    else:
+        st.info("Rate data will appear after the next planner run.")
+
+with col2:
+    st.subheader("Battery Capacity")
+    if cap_rows:
+        dates_aware = [datetime.datetime.fromisoformat(r[0]).replace(tzinfo=HEL_TZ) for r in cap_rows]
+        days_ago = [(now_for_log - d).total_seconds() / 86400 + 0.001 for d in dates_aware]
+        cap_vals = [r[1] for r in cap_rows]
+
+        # Try to detect unit from the kernel file name (optional)
+        unit = "µAh"   # default; you can change to "µWh" if your system uses energy_full
+        fig_cap = go.Figure()
+        fig_cap.add_trace(go.Scatter(
+            x=days_ago, y=cap_vals,
+            mode='lines+markers',
+            line=dict(color='#38BDF8', width=2),
+            marker=dict(size=4),
+            name="Capacity"
+        ))
+        fig_cap.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0F172A",
+            plot_bgcolor="#0F172A",
+            height=350,
+            margin=dict(l=50, r=30, t=50, b=50),
+            xaxis=dict(title="Days ago", type="log", tickformat=".1f", gridcolor="#1E293B"),
+            yaxis=dict(title="Capacity (%)", gridcolor="#1E293B", range=[0, 105]),
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_cap, use_container_width=True)
+    else:
+        st.info("Capacity data will appear after the next planner run.")
