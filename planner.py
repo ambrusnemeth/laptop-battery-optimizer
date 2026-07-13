@@ -56,6 +56,13 @@ def create_tables(conn):
             timestamp TEXT PRIMARY KEY,
             capacity REAL
         );
+        CREATE TABLE IF NOT EXISTS bucket_rate_log (
+            timestamp TEXT NOT NULL,
+            bucket INTEGER NOT NULL,   -- 0 to 4
+            charge_rate REAL,
+            discharge_rate REAL,
+            PRIMARY KEY (timestamp, bucket)
+        );
     """)
     conn.commit()
 
@@ -126,12 +133,17 @@ def to_hel_naive(dt_aware):
     hel_dt = dt_aware.astimezone(HEL_TZ)
     return hel_dt.replace(tzinfo=None).isoformat()
 
-def compute_dynamic_rates(conn, now_hel, lookback_days=7):
+def compute_bucket_rates(conn, now_hel, lookback_days=7):
     """
-    Compute average charge and discharge rates (% per 5 min) from the last `lookback_days`.
-    Matches each SoC delta to the scheduled on/off decision for that interval.
+    Compute average charge and discharge rates (% per 5 min) for each SoC bucket
+    from the last `lookback_days`. Falls back to default values if no data in a bucket.
     """
     start_date = (now_hel - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    # Default fallback rates (will be used if no data in a bucket)
+    # These can be tuned later
+    default_charge = [5.0, 5.0, 4.5, 2.0, 1.0]  # for buckets 0..4
+    default_discharge = [2.5, 2.8, 3.0, 3.2, 3.5]
 
     rows = conn.execute("""
         SELECT timestamp, soc FROM soc_log
@@ -140,8 +152,8 @@ def compute_dynamic_rates(conn, now_hel, lookback_days=7):
     """, (start_date,)).fetchall()
 
     if len(rows) < 2:
-        logging.warning("Not enough SoC data for dynamic rates.")
-        return 50.0 / 12, 33.33 / 12   # fallback defaults
+        logging.warning("Not enough SoC data for bucket rates.")
+        return default_charge, default_discharge
 
     sched_rows = conn.execute("""
         SELECT interval_start, decision FROM schedule
@@ -149,8 +161,9 @@ def compute_dynamic_rates(conn, now_hel, lookback_days=7):
     """, (start_date,)).fetchall()
     sched_dict = {row[0]: row[1] for row in sched_rows}
 
-    charge_deltas = []
-    discharge_deltas = []
+    # Accumulators per bucket: [ [charge_deltas], [discharge_deltas] ]
+    charge_deltas = [[] for _ in range(5)]
+    discharge_deltas = [[] for _ in range(5)]
 
     for i in range(len(rows) - 1):
         ts1_str, soc1 = rows[i]
@@ -158,12 +171,25 @@ def compute_dynamic_rates(conn, now_hel, lookback_days=7):
         ts1 = datetime.datetime.fromisoformat(ts1_str).replace(tzinfo=HEL_TZ)
         ts2 = datetime.datetime.fromisoformat(ts2_str).replace(tzinfo=HEL_TZ)
         delta_sec = (ts2 - ts1).total_seconds()
-
-        # Only use intervals close to 5 minutes (4.5 - 5.5 min) to avoid gaps
         if not (270 <= delta_sec <= 330):
             continue
 
-        # Determine which 5-min block ts1 belongs to
+        # Determine bucket from starting SoC
+        bucket = None
+        if 0 <= soc1 < 30:
+            bucket = 0
+        elif 30 <= soc1 < 50:
+            bucket = 1
+        elif 50 <= soc1 < 70:
+            bucket = 2
+        elif 70 <= soc1 < 90:
+            bucket = 3
+        elif 90 <= soc1 <= 100:
+            bucket = 4
+        else:
+            continue
+
+        # Find schedule decision for this 5‑min block
         minute_of_day = ts1.hour * 60 + ts1.minute
         block_start = ts1.replace(hour=0, minute=0, second=0, microsecond=0) \
                        + datetime.timedelta(minutes=(minute_of_day // 5) * 5)
@@ -173,23 +199,64 @@ def compute_dynamic_rates(conn, now_hel, lookback_days=7):
             continue
 
         delta_soc = soc2 - soc1
-        if decision == 1:
-            charge_deltas.append(delta_soc)
+        if decision == 1:      # charging
+            charge_deltas[bucket].append(delta_soc)
+        else:                  # discharging
+            discharge_deltas[bucket].append(delta_soc)
+
+    # Compute averages per bucket (with fallback)
+    raw_charge = []
+    raw_discharge = []
+    for b in range(5):
+        if charge_deltas[b]:
+            raw_charge.append(sum(charge_deltas[b]) / len(charge_deltas[b]))
         else:
-            discharge_deltas.append(delta_soc)
+            raw_charge.append(None)
+        if discharge_deltas[b]:
+            # discharge deltas are negative; store as positive rate
+            raw_discharge.append(-sum(discharge_deltas[b]) / len(discharge_deltas[b]))
+        else:
+            raw_discharge.append(None)
 
-    charge_rate = sum(charge_deltas) / len(charge_deltas) if charge_deltas else None
-    discharge_rate = sum(discharge_deltas) / len(discharge_deltas) if discharge_deltas else None
+    # Load previous day's bucket rates to cap change
+    prev_rows = conn.execute(
+        "SELECT bucket, charge_rate, discharge_rate FROM bucket_rate_log "
+        "WHERE date(timestamp) = ? ORDER BY bucket",
+        ((now_hel - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),)
+    ).fetchall()
+    prev_charge = {}
+    prev_discharge = {}
+    for row in prev_rows:
+        prev_charge[row[0]] = row[1]
+        prev_discharge[row[0]] = row[2]
 
-    if discharge_rate is not None:
-        discharge_rate = -discharge_rate   # store as positive rate
-    if charge_rate is None:
-        charge_rate = 50.0 / 12
-    if discharge_rate is None:
-        discharge_rate = 33.33 / 12
+    max_change = 0.2  # % per 5 min daily change limit
 
-    logging.info(f"Dynamic rates: charge = {charge_rate:.4f} %/5min, discharge = {discharge_rate:.4f} %/5min")
-    return charge_rate, discharge_rate
+    final_charge = []
+    final_discharge = []
+    for b in range(5):
+        # Fallback chain: computed → previous day → default
+        ch = raw_charge[b]
+        dch = raw_discharge[b]
+        if ch is None:
+            ch = prev_charge.get(b, None)
+        if dch is None:
+            dch = prev_discharge.get(b, None)
+        if ch is None:
+            ch = default_charge[b]
+        if dch is None:
+            dch = default_discharge[b]
+
+        # Cap change from previous day
+        if b in prev_charge:
+            ch = max(prev_charge[b] - max_change, min(prev_charge[b] + max_change, ch))
+            dch = max(prev_discharge[b] - max_change, min(prev_discharge[b] + max_change, dch))
+
+        final_charge.append(round(ch, 4))
+        final_discharge.append(round(dch, 4))
+
+    logging.info(f"Bucket rates: charge {final_charge}, discharge {final_discharge}")
+    return final_charge, final_discharge
 
 def create_charging_plan():
     """Main planner function – fetch prices, solve MILP, store results."""
@@ -267,21 +334,56 @@ def create_charging_plan():
         "WHERE date(interval_start) = ? AND interval_start < ?",
         (today_date.isoformat(), to_hel_naive(start_time))
     ).fetchall()
-    # 7. Compute dynamic rates from the last 7 days
-    charge_rate_5, discharge_rate_5 = compute_dynamic_rates(conn, now_hel)
-    # 8. MILP with dynamic 5‑minute rates
+    # 7b. Compute bucket rates dynamically
+    ch_rates, dch_rates = compute_bucket_rates(conn, now_hel)
+
+    # 8. MILP with bucket‑dependent constant rates
     start_soc = get_current_soc()
-    prob = pulp.LpProblem("Battery_5min", pulp.LpMinimize)
+    prob = pulp.LpProblem("Battery_5min_buckets", pulp.LpMinimize)
+
+    # Binary charge decision per step
     x = pulp.LpVariable.dicts("charge", range(num_steps), cat='Binary')
-    soc = pulp.LpVariable.dicts("soc", range(num_steps + 1), lowBound=20, upBound=100)
+
+    # SOC variables
+    soc = pulp.LpVariable.dicts("soc", range(num_steps + 1), lowBound=0, upBound=100)
+
+    # Bucket indicators: b[t][b] = 1 if soc[t] is in bucket b (0..4)
+    b = pulp.LpVariable.dicts("bucket", (range(num_steps), range(5)), cat='Binary')
+
+    # Auxiliary variables y[t][b] = x[t] * b[t][b] (binary)
+    y = pulp.LpVariable.dicts("y", (range(num_steps), range(5)), cat='Binary')
+
+    # Bucket boundaries
+    L = [0, 30, 50, 70, 90]
+    U = [30, 50, 70, 90, 100]
 
     prob += soc[0] == start_soc
-    for t in range(num_steps):
-        prob += soc[t+1] == soc[t] + x[t] * charge_rate_5 - (1 - x[t]) * discharge_rate_5
 
+    for t in range(num_steps):
+        # Exactly one bucket
+        prob += pulp.lpSum([b[t][k] for k in range(5)]) == 1
+
+        # SOC bounds from the chosen bucket
+        prob += soc[t] >= pulp.lpSum([b[t][k] * L[k] for k in range(5)])
+        prob += soc[t] <= pulp.lpSum([b[t][k] * U[k] for k in range(5)])
+
+        # Linearise y[t][k] = x[t] * b[t][k]
+        for k in range(5):
+            prob += y[t][k] <= x[t]
+            prob += y[t][k] <= b[t][k]
+            prob += y[t][k] >= x[t] + b[t][k] - 1
+
+        # Charge / discharge amount
+        charge_amount = pulp.lpSum([y[t][k] * ch_rates[k] for k in range(5)])
+        discharge_amount = pulp.lpSum([(b[t][k] - y[t][k]) * dch_rates[k] for k in range(5)])
+
+        # SOC dynamics
+        prob += soc[t+1] == soc[t] + charge_amount - discharge_amount
+
+    # Objective: minimise cost
     prob += pulp.lpSum([x[t] * all_prices_5min[t] for t in range(num_steps)])
 
-    logging.info("Solving MILP...")
+    logging.info("Solving MILP with bucket rates...")
     solver = pulp.HiGHS(msg=1, timeLimit=60)
     prob.solve(solver)
 
@@ -308,8 +410,10 @@ def create_charging_plan():
     conn.execute("INSERT INTO plan_runs(run_time, start_time, end_time) VALUES (?, ?, ?)",
                  (to_hel_naive(now_hel), to_hel_naive(start_time), to_hel_naive(end_time)))
     # 11. Store dynamic rates into rate_log
-    conn.execute("INSERT OR REPLACE INTO rate_log(timestamp, charge_rate, discharge_rate) VALUES (?, ?, ?)",
-                 (to_hel_naive(now_hel), charge_rate_5, discharge_rate_5))
+    # Store bucket rates for today
+    for k in range(5):
+        conn.execute("INSERT OR REPLACE INTO bucket_rate_log(timestamp, bucket, charge_rate, discharge_rate) VALUES (?, ?, ?, ?)",
+                     (to_hel_naive(now_hel), k, ch_rates[k], dch_rates[k]))
     # 12. Read and store battery capacity (percentage of design)
     cap_pct = read_battery_capacity_pct()
     if cap_pct is not None:

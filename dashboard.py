@@ -87,6 +87,11 @@ cap_rows = conn.execute(
     "SELECT timestamp, capacity FROM capacity_log ORDER BY timestamp"
 ).fetchall()
 
+# SoC‑bucket rate history (NEW)
+bucket_rows = conn.execute(
+    "SELECT timestamp, bucket, charge_rate, discharge_rate FROM bucket_rate_log ORDER BY timestamp, bucket"
+).fetchall()
+
 conn.close()
 
 # ── build full‑day arrays (288 intervals of 5 minutes) ──
@@ -225,43 +230,52 @@ now_for_log = datetime.datetime.now(HEL_TZ)
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("Charge / Discharge Rate")
-    if rate_rows:
-        # Convert to datetime and days ago
-        dates_aware = [datetime.datetime.fromisoformat(r[0]).replace(tzinfo=HEL_TZ) for r in rate_rows]
-        days_ago = [(now_for_log - d).total_seconds() / 86400 + 0.001 for d in dates_aware]
-        charge_vals = [r[1] for r in rate_rows]
-        discharge_vals = [r[2] for r in rate_rows]
-
-        fig_rates = go.Figure()
-        fig_rates.add_trace(go.Scatter(
-            x=days_ago, y=charge_vals,
-            mode='lines+markers',
-            line=dict(color='#10B981', width=2),
-            marker=dict(size=4),
-            name="Charge Rate"
-        ))
-        fig_rates.add_trace(go.Scatter(
-            x=days_ago, y=discharge_vals,
-            mode='lines+markers',
-            line=dict(color='#F59E0B', width=2),
-            marker=dict(size=4),
-            name="Discharge Rate"
-        ))
-        fig_rates.update_layout(
+    st.subheader("SoC‑Bucket Charge & Discharge Rates")
+    if bucket_rows:
+        fig_bucket = go.Figure()
+        # One trace per bucket – colour coded
+        colors = ['#EF4444', '#F97316', '#EAB308', '#22C55E', '#3B82F6']
+        bucket_labels = ['0‑30%', '30‑50%', '50‑70%', '70‑90%', '90‑100%']
+    
+        now_for_log = datetime.datetime.now(HEL_TZ)
+        # Separate data per bucket
+        for b in range(5):
+            b_data = [row for row in bucket_rows if row[1] == b]
+            if not b_data:
+                continue
+            dates = [datetime.datetime.fromisoformat(row[0]).replace(tzinfo=HEL_TZ) for row in b_data]
+            days_ago = [(now_for_log - d).total_seconds() / 86400 + 0.001 for d in dates]
+            ch = [row[2] for row in b_data]
+            dch = [row[3] for row in b_data]
+            fig_bucket.add_trace(go.Scatter(
+                x=days_ago, y=ch,
+                mode='lines+markers',
+                line=dict(color=colors[b], width=2),
+                marker=dict(size=4),
+                name=f"Charge {bucket_labels[b]}"
+            ))
+            fig_bucket.add_trace(go.Scatter(
+                x=days_ago, y=dch,
+                mode='lines+markers',
+                line=dict(color=colors[b], width=2, dash='dot'),
+                marker=dict(size=4),
+                name=f"Discharge {bucket_labels[b]}"
+            ))
+        fig_bucket.update_layout(
             template="plotly_dark",
             paper_bgcolor="#0F172A",
             plot_bgcolor="#0F172A",
-            height=350,
-            margin=dict(l=50, r=30, t=50, b=50),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            height=500,
+            margin=dict(l=50, r=30, t=30, b=50),
             xaxis=dict(title="Days ago", type="log", tickformat=".1f", gridcolor="#1E293B"),
             yaxis=dict(title="% per 5 min", gridcolor="#1E293B"),
-            hovermode="x unified"
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02)
         )
-        st.plotly_chart(fig_rates, use_container_width=True)
+        st.plotly_chart(fig_bucket, use_container_width=True)
     else:
-        st.info("Rate data will appear after the next planner run.")
+        st.info("Bucket rate data will appear after the next planner run.")
+
 
 with col2:
     st.subheader("Battery Capacity")
